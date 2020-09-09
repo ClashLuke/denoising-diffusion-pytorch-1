@@ -7,16 +7,13 @@ import memcnn
 import numpy as np
 import torch
 import torchvision
-from torch import nn
+from torchvision import transforms, utils
+from tqdm import tqdm
 
 try:
     from . import PerfTorch as perftorch
 except ImportError:
     import PerfTorch as perftorch
-from torch.optim import Adam
-from torch.utils import data
-from torchvision import transforms, utils
-from tqdm import tqdm
 
 SAVE_AND_SAMPLE_EVERY = 1000
 UPDATE_EMA_EVERY = 10
@@ -125,7 +122,7 @@ def extract_sum(a, b, c, d, t, dim):
     return extract(a, t, dim) * c + extract(b, t, dim) * d
 
 
-class GaussianDiffusion(nn.Module):
+class GaussianDiffusion(torch.nn.Module):
     def __init__(self, denoise_fn, beta_start=0.0001, beta_end=0.02, num_diffusion_timesteps=1000, loss_type='l1',
                  betas=None):
         super().__init__()
@@ -288,8 +285,9 @@ class Trainer:
                                                        transforms.CenterCrop(image_size),
                                                        transforms.ToTensor()
                                                    ]))
-        self.dl = cycle(data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True))
-        self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+        self.dl = cycle(torch.utils.data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True,
+                                                    pin_memory=True))
+        self.opt = torch.optim.AdamW(diffusion_model.parameters(), lr=train_lr, weight_decay=1e-3)
 
         self.step = 0
 
