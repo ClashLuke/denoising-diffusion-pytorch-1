@@ -1,5 +1,7 @@
 import copy
 import math
+import os
+import time
 from functools import partial
 
 import memcnn
@@ -7,21 +9,22 @@ import numpy as np
 import torch
 import torchvision
 from torchvision import transforms, utils
-from tqdm import tqdm
 
 try:
-    from . import PerfTorch as perftorch
+    from .PerfTorch import dilatedconv
 except ImportError:
-    import PerfTorch as perftorch
+    from PerfTorch import dilatedconv
 
-SAVE_AND_SAMPLE_EVERY = 1000
-UPDATE_EMA_EVERY = 10
+SAMPLE_INTERVALL = 2 ** 12
+SAVE_INTERVALL = 2 ** 16
+UPDATE_EMA_EVERY = 2 ** 6
+PRINTERVALL = 2 ** 10
 
 
 def cycle(dl):
     while True:
         for data in dl:
-            yield data
+            yield data[0]
 
 
 activate = torch.nn.functional.gelu
@@ -70,47 +73,84 @@ class BasicBlock(torch.jit.ScriptModule):
         super(BasicBlock, self).__init__()
         self.noise = Noise(noise) if noise > 0 else torch.nn.Sequential()
         self.norm0 = Normalize(features) if in_norm else torch.nn.Sequential()
-        self.conv0 = perftorch.dilatedconv.DilatedConv(features, features, groups, size)
+        self.conv0 = dilatedconv.DilatedConv(features, features, groups, size)
         self.norm1 = Normalize(features)
-        self.conv1 = perftorch.dilatedconv.DilatedConv(features, features, groups, size)
+        self.conv1 = dilatedconv.DilatedConv(features, features, groups, size)
         self.gate = torch.nn.Parameter(torch.zeros(1) + 1)
 
     def forward(self, inp):
         return self.conv1(self.norm1(self.conv0(self.norm0(self.noise(inp))))) * self.gate
 
 
+class Embedding(torch.jit.ScriptModule):
+
+    def __init__(self, dim):
+        assert dim % 2 == 0
+        super(Embedding, self).__init__()
+        self.register_buffer('embedding_factor', 0.5 ** torch.arange(0, dim // 2).float().view(1, -1))
+
+    def forward(self, inp):
+        embedded = self.embedding_factor * inp.view(-1, 1)
+        return torch.cat([embedded.sin(), embedded.cos()], 1)
+
+
 class Unet(torch.nn.Module):
-    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, size=32, noise=0.3):
+    def __init__(self, dim=None, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, size=32, noise=0.3):
         super(Unet, self).__init__()
-        depth = int(math.sqrt(size))
-        groups = int(math.log2(size)) - 2  # 4 groups = 3;5;9;17
-        features = depth * groups * 2
+
+        self.size = size
+        depth, groups, features = self._get_parameters()
+        self.embed = Embedding(features)
 
         def layer():
             return BasicBlock(features // 2, size, groups, True, noise)
 
         self.blocks = torch.nn.ModuleList([memcnn.InvertibleModuleWrapper(memcnn.AdditiveCoupling(layer(), layer()))
                                            for _ in range(depth)])
-        self.dense = torch.nn.Parameter(torch.empty(2, dim, dim))
+        self.dense = torch.nn.Parameter(torch.empty(2, features, features))
         torch.nn.init.orthogonal_(self.dense[0])
         torch.nn.init.orthogonal_(self.dense[1])
+        self.features3 = features - 3
+
+    def _get_parameters(self):
+        depth = int(math.sqrt(self.size))
+        groups = int(math.log2(self.size) ** 0.5)
+        features = depth * groups * 2
+        return depth, groups, features
 
     @torch.jit.export
-    def forward(self, inp, time):
-        time = activate(time.mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
+    def forward(self, inp, time_tensor):
+        size = list(inp.size())
+        size[1] = self.features3
+        time_tensor = self.embed(time_tensor)
+        time_tensor = activate(time_tensor.to(inp.dtype).mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
+        inp = torch.cat([inp, torch.zeros(size, device=inp.device, dtype=inp.dtype)], 1)
         for block in self.blocks:
-            inp = block(inp + time)
-        return inp
+            inp = block(inp + time_tensor)
+        out = inp[:, :3]
+        return out
+
+    def __str__(self):
+        name = self.original_name if hasattr(self, 'original_name') else self.__class__.__name__
+        depth, groups, features = self._get_parameters()
+        return f'{name}(size={self.size}, depth={depth}, groups={groups}, features={features})'
+
+    def __repr__(self):
+        return str(self)
 
 
-def extract(a, t, xdim):
-    b = t.size()
+def extract(a, t, ndim):
+    ndim = ndim - 1
+    b = t.size(0)
     out = a.gather(-1, t)
-    return out.view(b, *((1,) * (xdim - 1)))
+    out = out.view(b, *(1,) * ndim)
+    return out
 
 
 def extract_sum(a, b, c, d, t, dim):
-    return extract(a, t, dim) * c + extract(b, t, dim) * d
+    mul0 = extract(a, t, dim) * c
+    mul1 = extract(b, t, dim) * d
+    return mul0 + mul1
 
 
 class GaussianDiffusion(torch.nn.Module):
@@ -124,7 +164,7 @@ class GaussianDiffusion(torch.nn.Module):
         else:
             self.np_betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
 
-        timesteps = betas.size(0)
+        timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         loss_type = float(loss_type[1:])
         self.loss_fn = ((lambda x: x.pow(loss_type).mean())
@@ -183,13 +223,10 @@ class GaussianDiffusion(torch.nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
+    def p_sample(self, x, t, clip_denoised=True):
         b, device = x.size(0), x.device
         model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
-        if repeat_noise:
-            noise = torch.randn((1, *x.size()[1:]), device=device).expand(x.size(0), *((-1,) * (x.ndim - 1)))
-        else:
-            noise = torch.randn_like(x)
+        noise = torch.randn_like(x)
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
@@ -200,7 +237,7 @@ class GaussianDiffusion(torch.nn.Module):
         b = shape[0]
         img = torch.randn(shape, device=device)
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        for i in reversed(range(0, self.num_timesteps)):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
@@ -221,7 +258,7 @@ class GaussianDiffusion(torch.nn.Module):
         xt2 = self.q_sample(x2, t_batched, torch.randn_like(x2))
 
         img = (1 - lam) * xt1 + lam * xt2
-        for i in tqdm(reversed(range(t)), desc='interpolation sample time step', total=t):
+        for i in reversed(range(t)):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
 
         return img
@@ -249,7 +286,7 @@ class GaussianDiffusion(torch.nn.Module):
 class Trainer:
     def __init__(
             self,
-            diffusion_model,
+            diffusion_model_factory,
             folder,
             *,
             ema_decay=0.995,
@@ -261,9 +298,10 @@ class Trainer:
             fp16=False
     ):
         super().__init__()
-        self.model = diffusion_model
+        self.model = diffusion_model_factory()
         self.ema = EMA(ema_decay)
-        self.ema_model = copy.deepcopy(self.model)
+        self.ema_model = diffusion_model_factory()
+        self.reset_parameters()
 
         self.image_size = image_size
         self.gradient_accumulate_every = gradient_accumulate_every
@@ -278,14 +316,12 @@ class Trainer:
                                                    ]))
         self.dl = cycle(torch.utils.data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True,
                                                     pin_memory=True))
-        self.opt = torch.optim.AdamW(diffusion_model.parameters(), lr=train_lr, weight_decay=1e-3)
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=train_lr, weight_decay=1e-3)
 
         self.step = 0
 
-        self.reset_parameters()
-
     def reset_parameters(self):
-        self.ema_model.load_state_dict(self.model.state_dict())
+        self.ema_model.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
     def step_ema(self):
         if self.step < 2000:
@@ -299,21 +335,28 @@ class Trainer:
             'model': self.model.state_dict(),
             'ema': self.ema_model.state_dict()
         }
-        torch.save(data, f'./model-{milestone}.pt')
+        torch.save(data, os.path.join('Models', 'model-{milestone}.pt'))
 
     def load(self, milestone):
-        data = torch.load(f'./model-{milestone}.pt')
+        data = torch.load(os.path.join('Models', f'model-{milestone}.pt'))
 
         self.step = data['step']
         self.model.load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
 
     def train(self):
+        if not os.path.exists("Samples"):
+            os.mkdir("Samples")
+        if not os.path.exists("Models"):
+            os.mkdir("Models")
+        os.system("rm Samples/*")
+        os.system("rm Models/*")
+        self.step += 1
+        start_time = time.time()
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl).cuda()
                 loss = self.model(data)
-                print(f'{self.step}: {loss.item()}')
                 loss.div(self.gradient_accumulate_every).backward()
 
             self.opt.step()
@@ -322,11 +365,20 @@ class Trainer:
             if self.step % UPDATE_EMA_EVERY == 0:
                 self.step_ema()
 
-            if self.step % SAVE_AND_SAMPLE_EVERY == 0:
-                milestone = self.step // SAVE_AND_SAMPLE_EVERY
+            if self.step % SAMPLE_INTERVALL == 0:
+                milestone = self.step // SAMPLE_INTERVALL
                 all_images = self.ema_model.p_sample_loop((64, 3, self.image_size, self.image_size))
-                utils.save_image(all_images, f'./sample-{milestone}.png', nrow=8)
+                utils.save_image(all_images, os.path.join('Samples', f'sample-{milestone}.png'), nrow=8)
+
+            if self.step % SAVE_INTERVALL == 0:
+                milestone = self.step // SAVE_INTERVALL
                 self.save(milestone)
+
+            if self.step % PRINTERVALL == 0:
+                time.sleep(0.1)
+                print(f'\r\033[1A\033[1\r[{self.step:9d}] Loss: {loss.item():8.6f} - '
+                      f'Rate: {self.step / (time.time() - start_time):.1f} Step/s'
+                      ' ' * 10)
 
             self.step += 1
 
