@@ -10,9 +10,9 @@ import torchvision
 from torch import nn
 
 try:
-    from . import perftorch
+    from . import PerfTorch as perftorch
 except ImportError:
-    import perftorch
+    import PerfTorch as perftorch
 from torch.optim import Adam
 from torch.utils import data
 from torchvision import transforms, utils
