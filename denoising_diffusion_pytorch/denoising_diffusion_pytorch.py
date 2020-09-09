@@ -63,7 +63,7 @@ class Normalize(torch.jit.ScriptModule):
         self.norm = torch.nn.InstanceNorm2d(features, affine=True)
 
     def forward(self, inp):
-        return torch.nn.functional.leaky_relu(self.norm(inp), 0.1)
+        return activate(self.norm(inp))
 
 
 class Noise(torch.jit.ScriptModule):
