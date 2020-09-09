@@ -1,7 +1,6 @@
 import copy
 import math
 from functools import partial
-from inspect import isfunction
 
 import memcnn
 import numpy as np
@@ -17,14 +16,6 @@ except ImportError:
 
 SAVE_AND_SAMPLE_EVERY = 1000
 UPDATE_EMA_EVERY = 10
-
-
-def default(val, d):
-    if val is not None:
-        return val
-    if isfunction(d):
-        return d()
-    return d
 
 
 def cycle(dl):
