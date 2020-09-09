@@ -29,6 +29,9 @@ def cycle(dl):
             yield data
 
 
+activate = torch.nn.functional.gelu
+
+
 # small helper modules
 
 class EMA:
@@ -48,13 +51,17 @@ class EMA:
 
 
 class Unet(nn.Module):
-    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8):
+    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, features=32):
         super().__init__()
-        self.conv0 = torch.nn.Conv2d(3, dim, 3, padding=1)
-        self.conv1 = torch.nn.Conv2d(dim, 3, 3, padding=1)
+        self.conv0 = torch.nn.Conv2d(3, features, 3, padding=1)
+        self.conv1 = torch.nn.Conv2d(features, 3, 3, padding=1)
+        self.dense = torch.nn.Parameter(torch.empty(2, dim, dim))
+        torch.nn.init.orthogonal_(self.dense[0])
+        torch.nn.init.orthogonal_(self.dense[1])
 
     def forward(self, x, time):
-        return self.conv1(self.conv0(x))
+        embedding = activate(time.mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
+        return self.conv1(self.conv0(x) + embedding)
 
 
 def extract(a, t, xdim):
@@ -223,12 +230,13 @@ class Trainer:
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 
-        self.ds = torchvision.datasets.ImageFolder(folder, transforms.Compose([
-            transforms.Resize(image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor()
-        ]))
+        self.ds = torchvision.datasets.ImageFolder(folder,
+                                                   transforms.Compose([
+                                                       transforms.Resize(image_size),
+                                                       transforms.RandomHorizontalFlip(),
+                                                       transforms.CenterCrop(image_size),
+                                                       transforms.ToTensor()
+                                                   ]))
         self.dl = cycle(data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
 
