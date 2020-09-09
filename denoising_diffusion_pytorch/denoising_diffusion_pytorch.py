@@ -1,11 +1,18 @@
 import copy
+import math
 from functools import partial
 from inspect import isfunction
 
+import memcnn
 import numpy as np
 import torch
 import torchvision
 from torch import nn
+
+try:
+    from . import perftorch
+except ImportError:
+    import perftorch
 from torch.optim import Adam
 from torch.utils import data
 from torchvision import transforms, utils
@@ -50,18 +57,62 @@ class EMA:
         return old * self.beta + (1 - self.beta) * new
 
 
-class Unet(nn.Module):
-    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, features=32):
-        super().__init__()
-        self.conv0 = torch.nn.Conv2d(3, features, 3, padding=1)
-        self.conv1 = torch.nn.Conv2d(features, 3, 3, padding=1)
+class Normalize(torch.jit.ScriptModule):
+    def __init__(self, features):
+        super(Normalize, self).__init__()
+        self.norm = torch.nn.InstanceNorm2d(features, affine=True)
+
+    def forward(self, inp):
+        return torch.nn.functional.leaky_relu(self.norm(inp), 0.1)
+
+
+class Noise(torch.jit.ScriptModule):
+    __constants__ = ['noise']
+
+    def __init__(self, noise):
+        super(Noise, self).__init__()
+        self.noise = noise
+
+    def forward(self, inp):
+        return inp * (1 + torch.randn_like(inp) * self.noise) + torch.randn_like(inp) * self.noise
+
+
+class BasicBlock(torch.jit.ScriptModule):
+    def __init__(self, features, size, groups=1, in_norm=False, noise=0.):
+        super(BasicBlock, self).__init__()
+        self.noise = Noise(noise) if noise > 0 else torch.nn.Sequential()
+        self.norm0 = Normalize(features) if in_norm else torch.nn.Sequential()
+        self.conv0 = perftorch.dilatedconv.DilatedConv(features, features, groups, size)
+        self.norm1 = Normalize(features)
+        self.conv1 = perftorch.dilatedconv.DilatedConv(features, features, groups, size)
+        self.gate = torch.nn.Parameter(torch.zeros(1) + 1)
+
+    def forward(self, inp):
+        return self.conv1(self.norm1(self.conv0(self.norm0(self.noise(inp))))) * self.gate
+
+
+class Unet(torch.nn.Module):
+    def __init__(self, dim, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, size=32, noise=0.3):
+        super(Unet, self).__init__()
+        depth = int(math.sqrt(size))
+        groups = int(math.log2(size)) - 2  # 4 groups = 3;5;9;17
+        features = depth * groups * 2
+
+        def layer():
+            return BasicBlock(features // 2, size, groups, True, noise)
+
+        self.blocks = torch.nn.ModuleList([memcnn.InvertibleModuleWrapper(memcnn.AdditiveCoupling(layer(), layer()))
+                                           for _ in range(depth)])
         self.dense = torch.nn.Parameter(torch.empty(2, dim, dim))
         torch.nn.init.orthogonal_(self.dense[0])
         torch.nn.init.orthogonal_(self.dense[1])
 
-    def forward(self, x, time):
-        embedding = activate(time.mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
-        return self.conv1(self.conv0(x) + embedding)
+    @torch.jit.export
+    def forward(self, inp, time):
+        time = activate(time.mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
+        for block in self.blocks:
+            inp = block(inp + time)
+        return inp
 
 
 def extract(a, t, xdim):

@@ -1,0 +1,3 @@
+[submodule "PerfTorch"]
+	path = denoising_diffusion_pytorch/PerfTorch
+	url = https://github.com/ClashLuke/PerfTorch/

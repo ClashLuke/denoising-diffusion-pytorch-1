@@ -14,7 +14,7 @@ setup(
     'generative models'
   ],
   install_requires=[
-    'einops',
+    'memcnn',
     'numpy',
     'pillow',
     'torch',
