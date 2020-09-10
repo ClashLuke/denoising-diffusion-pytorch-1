@@ -16,7 +16,7 @@ except ImportError:
     from PerfTorch import dilatedconv
 
 SAMPLE_INTERVALL = 2 ** 12
-SAVE_INTERVALL = 2 ** 16
+SAVE_INTERVALL = 2 ** 14
 UPDATE_EMA_EVERY = 2 ** 6
 PRINTERVALL = 2 ** 10
 
@@ -27,7 +27,7 @@ def cycle(dl):
             yield data[0]
 
 
-activate = torch.nn.functional.gelu
+activate = partial(torch.nn.functional.leaky_relu, negative_slope=1e-3, inplace=True)
 
 
 # small helper modules
@@ -57,37 +57,24 @@ class Normalize(torch.jit.ScriptModule):
         return activate(self.norm(inp))
 
 
-class Noise(torch.jit.ScriptModule):
-    __constants__ = ['noise']
-
-    def __init__(self, noise):
-        super(Noise, self).__init__()
-        self.noise = noise
-
-    def forward(self, inp):
-        return inp * (1 + torch.randn_like(inp) * self.noise) + torch.randn_like(inp) * self.noise
-
-
 class BasicBlock(torch.jit.ScriptModule):
-    def __init__(self, features, size, groups=1, in_norm=False, noise=0.):
+    def __init__(self, features, in_norm=False, noise=0., dilation=1):
         super(BasicBlock, self).__init__()
-        self.noise = Noise(noise) if noise > 0 else torch.nn.Sequential()
         self.norm0 = Normalize(features) if in_norm else torch.nn.Sequential()
-        self.conv0 = dilatedconv.DilatedConv(features, features, groups, size)
+        self.conv0 = torch.nn.Conv2d(features, features, 3, padding=dilation, dilation=dilation)
         self.norm1 = Normalize(features)
-        self.conv1 = dilatedconv.DilatedConv(features, features, groups, size)
-        self.gate = torch.nn.Parameter(torch.zeros(1) + 1)
+        self.conv1 = torch.nn.Conv2d(features, features, 3, padding=1)
+        self.gate = torch.nn.Parameter(torch.zeros(1))
 
     def forward(self, inp):
-        return self.conv1(self.norm1(self.conv0(self.norm0(self.noise(inp))))) * self.gate
+        return self.conv1(self.norm1(self.conv0(self.norm0(inp)))) * self.gate
 
 
 class Embedding(torch.jit.ScriptModule):
-
     def __init__(self, dim):
         assert dim % 2 == 0
         super(Embedding, self).__init__()
-        self.register_buffer('embedding_factor', 0.5 ** torch.arange(0, dim // 2).float().view(1, -1))
+        self.register_buffer('embedding_factor', 0.5**torch.arange(0, dim // 2).float().view(1, -1))
 
     def forward(self, inp):
         embedded = self.embedding_factor * inp.view(-1, 1)
@@ -95,46 +82,51 @@ class Embedding(torch.jit.ScriptModule):
 
 
 class Unet(torch.nn.Module):
-    def __init__(self, dim=None, out_dim=None, dim_mults=(1, 2, 4, 8), groups=8, size=32, noise=0.3):
+    def __init__(self, dim=None, out_dim=None, dim_mults=(1, 2, 4, 8), feature_factor=1, size=32, noise=0.3):
         super(Unet, self).__init__()
 
         self.size = size
-        depth, groups, features = self._get_parameters()
+        depth, features = self._get_parameters()
+        features = int(features * feature_factor)
         self.embed = Embedding(features)
+        self.feature_factor = feature_factor
 
-        def layer():
-            return BasicBlock(features // 2, size, groups, True, noise)
+        def layer(dilation):
+            return BasicBlock(features // 2, True, noise, dilation + 1)
 
-        self.blocks = torch.nn.ModuleList([memcnn.InvertibleModuleWrapper(memcnn.AdditiveCoupling(layer(), layer()))
-                                           for _ in range(depth)])
-        self.dense = torch.nn.Parameter(torch.empty(2, features, features))
-        torch.nn.init.orthogonal_(self.dense[0])
-        torch.nn.init.orthogonal_(self.dense[1])
+        self.blocks = torch.nn.ModuleList([memcnn.InvertibleModuleWrapper(memcnn.AdditiveCoupling(layer(i), layer(i)))
+                                           for i in range(depth)])
+        self.dense = torch.nn.Parameter(torch.empty(2 + depth, features, features))
+        for i in range(2+depth):
+            torch.nn.init.orthogonal_(self.dense[i])
         self.features3 = features - 3
 
+    @torch.jit.export
     def _get_parameters(self):
         depth = int(math.sqrt(self.size))
-        groups = int(math.log2(self.size) ** 0.5)
-        features = depth * groups * 2
-        return depth, groups, features
+        features = depth * int(math.log2(self.size)) * 2
+        return depth, features
 
     @torch.jit.export
     def forward(self, inp, time_tensor):
         size = list(inp.size())
         size[1] = self.features3
         time_tensor = self.embed(time_tensor)
-        time_tensor = activate(time_tensor.to(inp.dtype).mm(self.dense[0])).mm(self.dense[1]).unsqueeze(2).unsqueeze(2)
+        time_tensor = activate(time_tensor.to(inp.dtype).mm(self.dense[0])).mm(self.dense[1])
         inp = torch.cat([inp, torch.zeros(size, device=inp.device, dtype=inp.dtype)], 1)
-        for block in self.blocks:
-            inp = block(inp + time_tensor)
+        for block, dense in zip(self.blocks, self.dense[2:]):
+            inp = block(inp + time_tensor.unsqueeze(2).unsqueeze(2))
+            time_tensor = activate(time_tensor).mm(dense)
         out = inp[:, :3]
         return out
 
+    @torch.jit.export
     def __str__(self):
         name = self.original_name if hasattr(self, 'original_name') else self.__class__.__name__
-        depth, groups, features = self._get_parameters()
-        return f'{name}(size={self.size}, depth={depth}, groups={groups}, features={features})'
+        depth, features = self._get_parameters()
+        return f'{name}(size={self.size}, depth={depth}, feature_factor={self.feature_factor}, features={features})'
 
+    @torch.jit.export
     def __repr__(self):
         return str(self)
 
@@ -376,7 +368,7 @@ class Trainer:
 
             if self.step % PRINTERVALL == 0:
                 time.sleep(0.1)
-                print(f'\r\033[1A\033[1\r[{self.step:9d}] Loss: {loss.item():8.6f} - '
+                print(f'[{self.step:9d}] Loss: {loss.item():8.6f} - '
                       f'Rate: {self.step / (time.time() - start_time):.1f} Step/s'
                       ' ' * 10)
 
